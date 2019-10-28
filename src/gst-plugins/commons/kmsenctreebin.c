@@ -356,8 +356,8 @@ kms_enc_tree_bin_set_target_bitrate (KmsEncTreeBin * self)
         new_width = "640";
         new_height = "360";
       } else {
-        new_width = "640";
-        new_height = "360";
+        new_width = "320";
+        new_height = "180";
       }
 
       if (!g_str_equal(new_width, self->priv->width)) {
@@ -553,31 +553,31 @@ kms_enc_tree_bin_configure (KmsEncTreeBin * self, const GstCaps * caps,
       tag_event_probe, self, NULL);
   g_object_unref (enc_src);
 
-  self->priv->rate = kms_utils_create_rate_for_caps(caps);
-  self->priv->convert = kms_utils_create_convert_for_caps(caps);
+  rate = kms_utils_create_rate_for_caps(caps);
+  convert = kms_utils_create_convert_for_caps(caps);
   if ((self->priv->enc_type == VAAPIVP8 || self->priv->enc_type ==
                                            VAAPIH264) && !kms_utils_caps_is_audio(caps)) {
     GST_ERROR ("(using vaapipostproc)");
-    self->priv->mediator = gst_element_factory_make("vaapipostproc", NULL);
+    mediator = gst_element_factory_make("vaapipostproc", NULL);
   } else {
-    self->priv->mediator = kms_utils_create_mediator_element(caps);
+    mediator = kms_utils_create_mediator_element(caps);
   }
-  self->priv->queue = kms_utils_element_factory_make("queue", "enctreebin_");
-  g_object_set(self->priv->queue, "leaky", 2, "max-size-time", LEAKY_TIME,
+  queue = kms_utils_element_factory_make("queue", "enctreebin_");
+  g_object_set(queue, "leaky", 2, "max-size-time", LEAKY_TIME,
                NULL);
 
-  if (self->priv->rate) {
-    gst_bin_add (GST_BIN (self), self->priv->rate);
+  if (rate) {
+    gst_bin_add (GST_BIN (self), rate);
   }
-  gst_bin_add_many(GST_BIN(self), self->priv->convert, self->priv->mediator,
-                   self->priv->queue, self->priv->enc, NULL);
+  gst_bin_add_many(GST_BIN(self), convert, mediator,
+                   queue, self->priv->enc, NULL);
   gst_element_sync_state_with_parent(self->priv->enc);
-  gst_element_sync_state_with_parent(self->priv->queue);
-  gst_element_sync_state_with_parent(self->priv->mediator);
-  gst_element_sync_state_with_parent(self->priv->convert);
+  gst_element_sync_state_with_parent(queue);
+  gst_element_sync_state_with_parent(mediator);
+  gst_element_sync_state_with_parent(convert);
 
-  if (self->priv->rate) {
-    gst_element_sync_state_with_parent(self->priv->rate);
+  if (rate) {
+    gst_element_sync_state_with_parent(rate);
   }
   // FIXME: This is a hack to avoid an error on x264enc that does not work
   // properly with some raw formats, this should be fixed in gstreamer
@@ -642,14 +642,14 @@ kms_enc_tree_bin_configure (KmsEncTreeBin * self, const GstCaps * caps,
     gst_element_sync_state_with_parent(self->priv->capsfilter);
   }
 
-  if (self->priv->rate) {
-    kms_tree_bin_set_input_element (tree_bin, self->priv->rate);
+  if (rate) {
+    kms_tree_bin_set_input_element (tree_bin, rate);
   } else {
-    kms_tree_bin_set_input_element (tree_bin, self->priv->convert);
+    kms_tree_bin_set_input_element (tree_bin, convert);
   }
   output_tee = kms_tree_bin_get_output_tee (tree_bin);
-  if (self->priv->rate) {
-    gst_element_link (self->priv->rate, self->priv->convert);
+  if (rate) {
+    gst_element_link (rate, convert);
   }
   if (self->priv->enc_type == X264) {
     gst_element_link_many (convert, mediator, self->priv->capsfilter, queue,
