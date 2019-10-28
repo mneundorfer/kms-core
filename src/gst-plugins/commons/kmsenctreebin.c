@@ -43,6 +43,8 @@ G_DEFINE_TYPE (KmsEncTreeBin, kms_enc_tree_bin, KMS_TYPE_TREE_BIN);
 
 typedef enum
 {
+  VAAPIVP8,
+  VAAPIH264,
   VP8,
   X264,
   OPENH264,
@@ -53,8 +55,11 @@ typedef enum
 struct _KmsEncTreeBinPrivate
 {
   GstElement *enc;
+  GstElement *capsfilter;
   EncoderType enc_type;
   RembEventManager *remb_manager;
+
+  gchar *width, *height;
 
   gint remb_bitrate;
   gint tag_bitrate;
@@ -69,6 +74,10 @@ static const gchar *
 kms_enc_tree_bin_get_name_from_type (EncoderType enc_type)
 {
   switch (enc_type) {
+    case VAAPIVP8:
+      // TODO(mn): This most likely is not needed (we don't need it for VAAPIH264 either...)
+      // Nevertheless, it currently returns NULL (called in line~200)
+      return "vp8";
     case VP8:
       return "vp8";
     case X264:
@@ -154,6 +163,23 @@ configure_encoder (GstElement * encoder, EncoderType type, gint target_bitrate,
       /* *INDENT-ON* */
       break;
     }
+    case VAAPIVP8: {
+      /* *INDENT-OFF* */
+      g_object_set(G_OBJECT(encoder),
+                   "bitrate", target_bitrate / 1000,
+                   "rate-control", 2,
+                   NULL);
+      /* *INDENT-ON* */
+      break;
+    }
+    case VAAPIH264: {
+      /* *INDENT-OFF* */
+      // TODO(mn): Check which of these are actually required
+      g_object_set(G_OBJECT(encoder), "bitrate", target_bitrate / 1000,
+                   "rate-control", 2, "keyframe-period", 300, "dct8x8", TRUE, "cpb-length", 7500, NULL);
+      /* *INDENT-ON* */
+      break;
+    }
     case X264:
     {
       /* *INDENT-OFF* */
@@ -199,7 +225,11 @@ kms_enc_tree_bin_set_encoder_type (KmsEncTreeBin * self)
 
   g_object_get (self->priv->enc, "name", &name, NULL);
 
-  if (g_str_has_prefix (name, "vp8enc")) {
+  if (g_str_has_prefix(name, "vaapiencodevp8")) {
+    self->priv->enc_type = VAAPIVP8;
+  } else if (g_str_has_prefix(name, "vaapiencodeh264")) {
+    self->priv->enc_type = VAAPIH264;
+  } else if (g_str_has_prefix (name, "vp8enc")) {
     self->priv->enc_type = VP8;
   } else if (g_str_has_prefix (name, "x264enc")) {
     self->priv->enc_type = X264;
@@ -239,6 +269,17 @@ kms_enc_tree_bin_create_encoder_for_caps (KmsEncTreeBin * self,
   encoder_factory = NULL;
   filtered_list =
       gst_element_factory_list_filter (encoder_list, caps, GST_PAD_SRC, FALSE);
+
+  for (l = filtered_list; l != NULL; l = l->next) {
+    GST_ERROR("(found encoder):: %s", GST_OBJECT_NAME(l->data));
+  }
+
+  // Force VAAPI for H264
+  // TODO(mn): remove this hard-coded string comparison...
+  if (g_str_has_prefix(GST_OBJECT_NAME(filtered_list->data), "openh264enc")) {
+    GST_ERROR("Enforcing VAAPI for H264");
+    filtered_list = filtered_list->next;
+  }
 
   for (l = filtered_list; l != NULL && encoder_factory == NULL; l = l->next) {
     encoder_factory = GST_ELEMENT_FACTORY (l->data);
@@ -289,10 +330,52 @@ kms_enc_tree_bin_set_target_bitrate (KmsEncTreeBin * self)
     return;
   }
 
-  GST_DEBUG_OBJECT (self->priv->enc, "Set target encoding bitrate: %d bps",
-      target_bitrate);
+  GST_ERROR("(target bitrate):: %d", target_bitrate);
+
+  GST_DEBUG_OBJECT(self->priv->enc, "Set target encoding bitrate: %d bps",
+                   target_bitrate);
 
   switch (self->priv->enc_type) {
+    case VAAPIH264:
+    case VAAPIVP8: {
+      guint last_br, new_br = target_bitrate / 1000;
+      g_object_get(self->priv->enc, "bitrate", &last_br, NULL);
+
+      if (last_br != new_br) {
+        g_object_set(self->priv->enc, "bitrate", new_br, NULL);
+      }
+
+      gchar *new_width, *new_height = NULL;
+      if (target_bitrate >= 2253333) {
+        new_width = "1920";
+        new_height = "1080";
+      } else if (target_bitrate > 953333) {
+        new_width = "1280";
+        new_height = "720";
+      } else if (target_bitrate > 306667) {
+        new_width = "640";
+        new_height = "360";
+      } else {
+        new_width = "640";
+        new_height = "360";
+      }
+
+      if (!g_str_equal(new_width, self->priv->width)) {
+        GST_ERROR("(new resolution):: %s", g_strconcat(new_width, "x", new_height, NULL));
+
+        self->priv->width = new_width;
+        self->priv->height = new_height;
+
+        GstCaps *filter_caps = gst_caps_from_string(g_strconcat("video/x-raw,width=", new_width, ",height=", new_height, NULL));
+
+        g_object_set(self->priv->capsfilter, "caps", filter_caps, NULL);
+        gst_caps_unref(filter_caps);
+
+        gst_element_sync_state_with_parent(self->priv->capsfilter);
+      }
+
+      break;
+    }
     case VP8:
     {
       gint last_br;
@@ -445,7 +528,7 @@ kms_enc_tree_bin_configure (KmsEncTreeBin * self, const GstCaps * caps,
     gint target_bitrate, GstStructure * codec_configs)
 {
   KmsTreeBin *tree_bin = KMS_TREE_BIN (self);
-  GstElement *rate, *convert, *mediator, *output_tee, *capsfilter = NULL;
+  GstElement *rate, *convert, *mediator, *output_tee = NULL;
   GstElement *queue;
   GstPad *enc_src;
 
@@ -470,23 +553,31 @@ kms_enc_tree_bin_configure (KmsEncTreeBin * self, const GstCaps * caps,
       tag_event_probe, self, NULL);
   g_object_unref (enc_src);
 
-  rate = kms_utils_create_rate_for_caps (caps);
-  convert = kms_utils_create_convert_for_caps (caps);
-  mediator = kms_utils_create_mediator_element (caps);
-  queue = kms_utils_element_factory_make ("queue", "enctreebin_");
-  g_object_set (queue, "leaky", 2, "max-size-time", LEAKY_TIME, NULL);
-
-  if (rate) {
-    gst_bin_add (GST_BIN (self), rate);
+  self->priv->rate = kms_utils_create_rate_for_caps(caps);
+  self->priv->convert = kms_utils_create_convert_for_caps(caps);
+  if ((self->priv->enc_type == VAAPIVP8 || self->priv->enc_type ==
+                                           VAAPIH264) && !kms_utils_caps_is_audio(caps)) {
+    GST_ERROR ("(using vaapipostproc)");
+    self->priv->mediator = gst_element_factory_make("vaapipostproc", NULL);
+  } else {
+    self->priv->mediator = kms_utils_create_mediator_element(caps);
   }
-  gst_bin_add_many (GST_BIN (self), convert, mediator, queue, self->priv->enc,
-      NULL);
-  gst_element_sync_state_with_parent (self->priv->enc);
-  gst_element_sync_state_with_parent (queue);
-  gst_element_sync_state_with_parent (mediator);
-  gst_element_sync_state_with_parent (convert);
-  if (rate) {
-    gst_element_sync_state_with_parent (rate);
+  self->priv->queue = kms_utils_element_factory_make("queue", "enctreebin_");
+  g_object_set(self->priv->queue, "leaky", 2, "max-size-time", LEAKY_TIME,
+               NULL);
+
+  if (self->priv->rate) {
+    gst_bin_add (GST_BIN (self), self->priv->rate);
+  }
+  gst_bin_add_many(GST_BIN(self), self->priv->convert, self->priv->mediator,
+                   self->priv->queue, self->priv->enc, NULL);
+  gst_element_sync_state_with_parent(self->priv->enc);
+  gst_element_sync_state_with_parent(self->priv->queue);
+  gst_element_sync_state_with_parent(self->priv->mediator);
+  gst_element_sync_state_with_parent(self->priv->convert);
+
+  if (self->priv->rate) {
+    gst_element_sync_state_with_parent(self->priv->rate);
   }
   // FIXME: This is a hack to avoid an error on x264enc that does not work
   // properly with some raw formats, this should be fixed in gstreamer
@@ -495,31 +586,77 @@ kms_enc_tree_bin_configure (KmsEncTreeBin * self, const GstCaps * caps,
     GstCaps *filter_caps = gst_caps_from_string ("video/x-raw,format=I420");
     GstPad *sink;
 
-    capsfilter = kms_utils_element_factory_make ("capsfilter", "enctreebin_");
-    sink = gst_element_get_static_pad (capsfilter, "sink");
+    self->priv->capsfilter = kms_utils_element_factory_make ("capsfilter", "enctreebin_");
+    sink = gst_element_get_static_pad (self->priv->capsfilter, "sink");
     gst_pad_add_probe (sink, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
         check_caps_probe, NULL, NULL);
     g_object_unref (sink);
 
-    g_object_set (capsfilter, "caps", filter_caps, NULL);
+    g_object_set (self->priv->capsfilter, "caps", filter_caps, NULL);
     gst_caps_unref (filter_caps);
 
-    gst_bin_add (GST_BIN (self), capsfilter);
-    gst_element_sync_state_with_parent (capsfilter);
+    gst_bin_add (GST_BIN (self), self->priv->capsfilter);
+    gst_element_sync_state_with_parent (self->priv->capsfilter);
   }
 
-  if (rate) {
-    kms_tree_bin_set_input_element (tree_bin, rate);
+  if (self->priv->enc_type == VAAPIVP8) {
+    GstCaps *filter_caps =
+        gst_caps_from_string("video/x-raw,width=640,height=360");
+    GstPad *sink;
+
+    self->priv->width = "640";
+    self->priv->height = "360";
+
+    self->priv->capsfilter =
+        kms_utils_element_factory_make("capsfilter", "enctreebin_");
+    sink = gst_element_get_static_pad(self->priv->capsfilter, "sink");
+    gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                      check_caps_probe, NULL, NULL);
+    g_object_unref(sink);
+
+    g_object_set(self->priv->capsfilter, "caps", filter_caps, NULL);
+    gst_caps_unref(filter_caps);
+
+    gst_bin_add(GST_BIN(self), self->priv->capsfilter);
+    gst_element_sync_state_with_parent(self->priv->capsfilter);
+  }
+  if (self->priv->enc_type == VAAPIH264) {
+    GstCaps *filter_caps =
+        gst_caps_from_string("video/x-raw");
+    GstPad *sink;
+
+    self->priv->width = "640";
+    self->priv->height = "360";
+
+    self->priv->capsfilter =
+        kms_utils_element_factory_make("capsfilter", "enctreebin_");
+    sink = gst_element_get_static_pad(self->priv->capsfilter, "sink");
+    gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                      check_caps_probe, NULL, NULL);
+    g_object_unref(sink);
+
+    g_object_set(self->priv->capsfilter, "caps", filter_caps, NULL);
+    gst_caps_unref(filter_caps);
+
+    gst_bin_add(GST_BIN(self), self->priv->capsfilter);
+    gst_element_sync_state_with_parent(self->priv->capsfilter);
+  }
+
+  if (self->priv->rate) {
+    kms_tree_bin_set_input_element (tree_bin, self->priv->rate);
   } else {
-    kms_tree_bin_set_input_element (tree_bin, convert);
+    kms_tree_bin_set_input_element (tree_bin, self->priv->convert);
   }
   output_tee = kms_tree_bin_get_output_tee (tree_bin);
-  if (rate) {
-    gst_element_link (rate, convert);
+  if (self->priv->rate) {
+    gst_element_link (self->priv->rate, self->priv->convert);
   }
   if (self->priv->enc_type == X264) {
-    gst_element_link_many (convert, mediator, capsfilter, queue,
-        self->priv->enc, output_tee, NULL);
+    gst_element_link_many (convert, mediator, self->priv->capsfilter, queue,
+                           self->priv->enc, output_tee, NULL);
+  } else if (self->priv->enc_type == VAAPIVP8) {
+    gst_element_link_many(convert, mediator, self->priv->capsfilter, queue,
+                          self->priv->enc, output_tee, NULL);
   } else {
     gst_element_link_many (convert, mediator, queue, self->priv->enc,
         output_tee, NULL);
