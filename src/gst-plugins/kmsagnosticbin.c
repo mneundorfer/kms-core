@@ -700,18 +700,18 @@ kms_agnostic_bin2_find_or_create_bin_for_caps (KmsAgnosticBin2 * self,
 {
   GstBin *bin;
   KmsMediaType type;
-  gchar* media_type = NULL;
+  gchar *media_type = NULL;
 
   if (kms_utils_caps_is_audio (caps)) {
     type = KMS_MEDIA_TYPE_AUDIO;
     media_type = g_strdup ("audio");
-  }
-  else {
+  } else {
     type = KMS_MEDIA_TYPE_VIDEO;
     media_type = g_strdup ("video");
   }
 
-  GST_DEBUG_OBJECT (self, "Find TreeBin with wanted caps: %" GST_PTR_FORMAT, caps);
+  GST_DEBUG_OBJECT (self, "Find TreeBin with wanted caps: %" GST_PTR_FORMAT,
+      caps);
 
   bin = kms_agnostic_bin2_find_bin_for_caps (self, caps);
 
@@ -727,13 +727,11 @@ kms_agnostic_bin2_find_or_create_bin_for_caps (KmsAgnosticBin2 * self,
       g_signal_emit (GST_BIN (self),
           kms_agnostic_bin2_signals[SIGNAL_MEDIA_TRANSCODING], 0, TRUE, type);
       GST_INFO_OBJECT (self, "TRANSCODING ACTIVE for %s", media_type);
-    }
-    else {
+    } else {
       GST_DEBUG_OBJECT (self, "Suppressed - TRANSCODING ACTIVE for %s",
           media_type);
     }
-  }
-  else {
+  } else {
     GST_DEBUG_OBJECT (self, "TreeBin found! Use it for %s", media_type);
 
     if (!self->priv->transcoding_emitted) {
@@ -741,8 +739,7 @@ kms_agnostic_bin2_find_or_create_bin_for_caps (KmsAgnosticBin2 * self,
       g_signal_emit (GST_BIN (self),
           kms_agnostic_bin2_signals[SIGNAL_MEDIA_TRANSCODING], 0, FALSE, type);
       GST_INFO_OBJECT (self, "TRANSCODING INACTIVE for %s", media_type);
-    }
-    else {
+    } else {
       GST_DEBUG_OBJECT (self, "Suppressed - TRANSCODING INACTIVE for %s",
           media_type);
     }
@@ -771,7 +768,8 @@ kms_agnostic_bin2_link_pad (KmsAgnosticBin2 * self, GstPad * pad, GstPad * peer)
 
   pad_caps = gst_pad_query_caps (pad, NULL);
   if (pad_caps != NULL) {
-    GST_INFO_OBJECT (self, "Upstream provided caps: %" GST_PTR_FORMAT, pad_caps);
+    GST_INFO_OBJECT (self, "Upstream provided caps: %" GST_PTR_FORMAT,
+        pad_caps);
     gst_caps_unref (pad_caps);
   }
 
@@ -927,12 +925,19 @@ kms_agnostic_bin2_configure_input (KmsAgnosticBin2 * self, const GstCaps * caps)
   KMS_AGNOSTIC_BIN2_LOCK (self);
 
   if (self->priv->input_bin != NULL) {
-    kms_tree_bin_unlink_input_element_from_tee (KMS_TREE_BIN (self->
-            priv->input_bin));
+    kms_tree_bin_unlink_input_element_from_tee (KMS_TREE_BIN (self->priv->
+            input_bin));
   }
+  // (mn) we never arrive here when streaming h264 through the rtspsrc with vaapi installed
+//  GST_ERROR ("------ Caps inside agnosticbin: %s", gst_caps_to_string(caps));
 
   parse_bin = kms_parse_tree_bin_new (caps);
   self->priv->input_bin = GST_BIN (parse_bin);
+
+//  GstElement *autovideosink = kms_utils_element_factory_make("autovideosink", "kmsagnosticbin_");
+//  autovideosinkpad = gst_element_get_static_pad (autovideosink, "sink");
+//  gst_element_link (self->priv->input_tee, autovideosinkpad);
+//  gst_element_sync_state_with_parent(autovideosink);
 
   parser = kms_parse_tree_bin_get_parser (KMS_PARSE_TREE_BIN (parse_bin));
   parser_src = gst_element_get_static_pad (parser, "src");
@@ -1002,8 +1007,7 @@ kms_agnostic_bin2_sink_caps_probe (GstPad * pad, GstPadProbeInfo * info,
         && !kms_utils_caps_is_raw (new_caps)) {
       GST_DEBUG_OBJECT (self, "Set new caps: %" GST_PTR_FORMAT, new_caps);
       kms_agnostic_bin2_configure_input (self, new_caps);
-    }
-    else {
+    } else {
       GST_DEBUG_OBJECT (self, "No need to set new caps");
     }
 
@@ -1201,7 +1205,8 @@ kms_agnostic_bin2_set_property (GObject * object, guint property_id,
         GST_WARNING_OBJECT (self, "Setting max-bitrate less than min-bitrate");
       }
       self->priv->max_bitrate = v;
-      GST_DEBUG_OBJECT (self, "max_bitrate configured %d", self->priv->max_bitrate);
+      GST_DEBUG_OBJECT (self, "max_bitrate configured %d",
+          self->priv->max_bitrate);
       kms_agnostic_bin_set_encoders_bitrate (self);
       KMS_AGNOSTIC_BIN2_UNLOCK (self);
       break;
@@ -1309,8 +1314,7 @@ kms_agnostic_bin2_class_init (KmsAgnosticBin2Class * klass)
       G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST,
       G_STRUCT_OFFSET (KmsAgnosticBin2Class, media_transcoding), NULL,
-      NULL, NULL, G_TYPE_NONE,
-      2, G_TYPE_BOOLEAN, KMS_TYPE_MEDIA_TYPE);
+      NULL, NULL, G_TYPE_NONE, 2, G_TYPE_BOOLEAN, KMS_TYPE_MEDIA_TYPE);
 
   g_type_class_add_private (klass, sizeof (KmsAgnosticBin2Private));
 }
@@ -1347,12 +1351,13 @@ check_ret_error (GstPad * pad, GstFlowReturn ret)
     case GST_FLOW_OK:
     case GST_FLOW_FLUSHING:
       break;
-    case GST_FLOW_ERROR: {
+    case GST_FLOW_ERROR:{
 
       KmsAgnosticBin2 *self =
           KMS_AGNOSTIC_BIN2 (gst_pad_get_parent_element (pad));
 
       gchar *fakesink_message;
+
       g_object_get (self->priv->input_fakesink, "last-message",
           &fakesink_message, NULL);
       GST_FIXME_OBJECT (pad, "Handling flow error, fakesink message: %s",
@@ -1361,12 +1366,12 @@ check_ret_error (GstPad * pad, GstFlowReturn ret)
 
       GST_FIXME_OBJECT (pad, "REPLACE FAKESINK");
       GstElement *fakesink = self->priv->input_fakesink;
+
       kms_utils_bin_remove (GST_BIN (self), fakesink);
       fakesink = kms_utils_element_factory_make ("fakesink", "agnosticbin_");
       self->priv->input_fakesink = fakesink;
       g_object_set (fakesink, "async", FALSE, "sync", FALSE,
-          "silent", FALSE,
-          NULL);
+          "silent", FALSE, NULL);
 
       gst_bin_add (GST_BIN (self), fakesink);
       gst_element_sync_state_with_parent (fakesink);
@@ -1374,6 +1379,7 @@ check_ret_error (GstPad * pad, GstFlowReturn ret)
 
       // fakesink setup
       GstPad *sink = gst_element_get_static_pad (fakesink, "sink");
+
       gst_pad_add_probe (sink, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
           kms_agnostic_bin2_sink_caps_probe, self, NULL);
       g_object_unref (sink);
@@ -1437,8 +1443,7 @@ kms_agnostic_bin2_init (KmsAgnosticBin2 * self)
 
   fakesink = kms_utils_element_factory_make ("fakesink", "agnosticbin_");
   self->priv->input_fakesink = fakesink;
-  g_object_set (fakesink, "async", FALSE, "sync", FALSE,
-      "silent", FALSE, // FIXME used to print log in check_ret_error()
+  g_object_set (fakesink, "async", FALSE, "sync", FALSE, "silent", FALSE,       // FIXME used to print log in check_ret_error()
       NULL);
 
   gst_bin_add_many (GST_BIN (self), tee, fakesink, NULL);
