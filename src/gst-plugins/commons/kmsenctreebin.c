@@ -74,10 +74,6 @@ static const gchar *
 kms_enc_tree_bin_get_name_from_type (EncoderType enc_type)
 {
   switch (enc_type) {
-    case VAAPIVP8:
-      // TODO(mn): This most likely is not needed (we don't need it for VAAPIH264 either...)
-      // Nevertheless, it currently returns NULL (called in line~200)
-      return "vp8";
     case VP8:
       return "vp8";
     case X264:
@@ -164,7 +160,8 @@ configure_encoder (GstElement * encoder, EncoderType type, gint target_bitrate,
       break;
     }
     case VAAPIH264:
-    case VAAPIVP8:{
+    case VAAPIVP8:
+    {
       /* *INDENT-OFF* */
       g_object_set(G_OBJECT(encoder),
                    "bitrate", target_bitrate / 1000,
@@ -267,7 +264,7 @@ kms_enc_tree_bin_create_encoder_for_caps (KmsEncTreeBin * self,
     GST_INFO ("found encoder: %s", GST_OBJECT_NAME (l->data));
   }
 
-  // Force VAAPI for H264
+  // force VAAPI for H264
   // TODO(mn): remove this hard-coded string comparison...
   if (g_str_has_prefix (GST_OBJECT_NAME (filtered_list->data), "openh264enc")) {
     GST_WARNING ("enforcing VAAPI for H264");
@@ -329,8 +326,14 @@ kms_enc_tree_bin_set_target_bitrate (KmsEncTreeBin * self)
       target_bitrate);
 
   switch (self->priv->enc_type) {
+    case VAAPIVP8:
     case VAAPIH264:
-    case VAAPIVP8:{
+    {
+      // the default task to to here would be to divide by 1000 to receive the correct
+      // target bitrate. this, however, results in way too crappy image quality.
+      // the lower the value we divide by, the higher the image quality
+      // 500 seems to be the best fit so far (250 results in a too high bitrate
+      // and therefore too laggy streaming)
       guint last_br, new_br = target_bitrate / 500;
 
       g_object_get (self->priv->enc, "bitrate", &last_br, NULL);
@@ -341,15 +344,24 @@ kms_enc_tree_bin_set_target_bitrate (KmsEncTreeBin * self)
 
       gchar *new_width, *new_height = NULL;
 
+      // this affects the initial stream resolution. the min value
+      // is 300000, the max value 500000. It can be tweaked from the
+      // js client via setMinVideoSendBandwidth
       if (target_bitrate >= 4000000) {
         new_width = "1920";
         new_height = "1080";
+      } else if (target_bitrate > 2750000) {
+        new_width = "1600";
+        new_height = "900";
       } else if (target_bitrate > 1500000) {
         new_width = "1280";
         new_height = "720";
-      } else if (target_bitrate > 1200000) {
+      } else if (target_bitrate > 1250000) {
         new_width = "960";
         new_height = "540";
+      } else if (target_bitrate > 1000000) {
+        new_width = "800";
+        new_height = "450";
       } else if (target_bitrate > 800000) {
         new_width = "640";
         new_height = "360";
@@ -362,7 +374,7 @@ kms_enc_tree_bin_set_target_bitrate (KmsEncTreeBin * self)
       }
 
       if (!g_str_equal (new_width, self->priv->width)) {
-        GST_INFO ("(new resolution):: %s", g_strconcat (new_width, "x",
+        GST_WARNING ("(new resolution):: %s", g_strconcat (new_width, "x",
                 new_height, NULL));
 
         self->priv->width = new_width;
@@ -370,8 +382,9 @@ kms_enc_tree_bin_set_target_bitrate (KmsEncTreeBin * self)
 
         GstCaps *filter_caps =
             gst_caps_from_string (g_strconcat ("video/x-raw,width=", new_width,
-                ",height=", new_height, ",pixel-aspect-ratio=1/1", NULL));
+                ",height=", new_height, NULL));
 
+        // attention: this crashes for VAAPI VP8 encoding on most resolutions (1280x720, 1920x1080 and 1600x900, 640x360 and 960x540 seem to work though)
         g_object_set (self->priv->capsfilter, "caps", filter_caps, NULL);
         gst_caps_unref (filter_caps);
       }
@@ -559,9 +572,8 @@ kms_enc_tree_bin_configure (KmsEncTreeBin * self, const GstCaps * caps,
   convert = kms_utils_create_convert_for_caps (caps);
   if ((self->priv->enc_type == VAAPIVP8 || self->priv->enc_type ==
           VAAPIH264) && !kms_utils_caps_is_audio (caps)) {
-    GST_WARNING ("using vaapipostproc");
+    GST_WARNING ("using vaapipostproc instead of videoscale!");
     self->priv->mediator = gst_element_factory_make ("vaapipostproc", NULL);
-//    g_object_set(self->priv->mediator, "width", 640, "height", 360, NULL);
   } else {
     self->priv->mediator = kms_utils_create_mediator_element (caps);
   }
@@ -602,14 +614,41 @@ kms_enc_tree_bin_configure (KmsEncTreeBin * self, const GstCaps * caps,
   }
 
   if (self->priv->enc_type == VAAPIVP8 || self->priv->enc_type == VAAPIH264) {
-    // initially start with 640x360 - will be scaled up if the bandwidth is sufficient
+    // initially start with 320x180 - will be scaled up if the bandwidth is sufficient
+    // for vaapivp8enc (does not hold true for vaapih264enc!), the width/height set here
+    // are the minimum values to which the stream can be adjusted.
+
+    // if we don't set anything here or if we set a value higher than the value to which we scale, the result is:
+    // 0:00:02.467398926 10754 0x7f963c031630 WARN enctreebin kmsenctreebin.c:410:kms_enc_tree_bin_set_target_bitrate: (new resolution):: 320x180
+    // Segmentation fault (thread 140282142701312, pid 10754)
+    // Stack trace:
+    // [gst_plugin_vaapi_register]
+    // /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvaapi.so:0x5AE90
+    // [gst_plugin_vaapi_register]
+    // /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvaapi.so:0x2B7CD
+    // [gst_plugin_vaapi_register]
+    // /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvaapi.so:0x2BD49
+    // [gst_plugin_vaapi_register]
+    // /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvaapi.so:0x2BFCE
+    // [gst_tag_setter_get_tag_merge_mode]
+    // /usr/lib/x86_64-linux-gnu/libgstreamer-1.0.so.0:0xAB269
+    // [g_thread_pool_new]
+    // /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0:0x74B60
+    // [g_test_get_filename]
+    // /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0:0x74195
+    // [start_thread]
+    // /build/glibc-OTsEL5/glibc-2.27/nptl/pthread_create.c:463
+    // [clone]
+    // sysdeps/unix/sysv/linux/x86_64/clone.S:97
+    //
+    // Process finished with exit code 134 (interrupted by signal 6: SIGABRT)
+
     GstCaps *filter_caps =
-        gst_caps_from_string
-        ("video/x-raw,width=640,height=360,pixel-aspect-ratio=1/1");
+        gst_caps_from_string ("video/x-raw,width=320,height=180");
     GstPad *sink;
 
-    self->priv->width = "640";
-    self->priv->height = "360";
+    self->priv->width = "320";
+    self->priv->height = "180";
 
     self->priv->capsfilter =
         kms_utils_element_factory_make ("capsfilter", "enctreebin_");
@@ -640,11 +679,18 @@ kms_enc_tree_bin_configure (KmsEncTreeBin * self, const GstCaps * caps,
   } else if (self->priv->enc_type == VAAPIVP8
       || self->priv->enc_type == VAAPIH264) {
     GstElement *streamfilter;
+    GstCaps *streamcaps;
 
     streamfilter =
         kms_utils_element_factory_make ("capsfilter", "kmsenctreebin_");
-    GstCaps *streamcaps =
-        gst_caps_from_string ("video/x-h264,stream-format=byte-stream");
+
+    if (self->priv->enc_type == VAAPIH264) {
+      streamcaps =
+          gst_caps_from_string ("video/x-h264,stream-format=byte-stream");
+    } else {
+      streamcaps = gst_caps_from_string ("video/x-vp8");
+    }
+
     g_object_set (streamfilter, "caps", streamcaps, NULL);
     gst_bin_add_many (GST_BIN (self), streamfilter, NULL);
     gst_caps_unref (streamcaps);
