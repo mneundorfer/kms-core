@@ -43,10 +43,17 @@ G_DEFINE_QUARK (KMS_REMB_REMOTE, kms_remb_remote);
 
 #define REMB_MAX_FACTOR_INPUT_BR 2
 
-struct remb_info {
-    guint32* bitrate;
-    char type[5];
+#ifndef __INFLUX_BATCH_SIZE__
+#define __INFLUX_BATCH_SIZE__ 25
+#endif
+
+struct br_estimation {
+    guint32 bitrate;
+    unsigned long timestamp;
 };
+
+struct br_estimation* bitrate_estimations [ __INFLUX_BATCH_SIZE__ ];
+int br_estimation_counter = 0;
 
 static void
 kms_remb_base_destroy (KmsRembBase * self)
@@ -443,12 +450,10 @@ typedef struct _AddSsrcsData
 } AddSsrcsData;
 
 static void
-*send_remb_to_influx (void *bitrate)
+*send_remb_to_influx (void *bre)
 {
-  guint32 br = *(guint32*) bitrate;
+  struct br_estimation** br = (struct br_estimation**) bre;
 
-  const char* als_client_host = getenv("ALS_CLIENT_HOST");
-  const char* host = (als_client_host!=NULL)? als_client_host : "unknown";
   const char* als_influx_host = getenv("ALS_INFLUX_HOST");
   const char* influx_host = (als_influx_host!=NULL)? als_influx_host : "127.0.0.1";
   const char* als_influx_db = getenv("ALS_INFLUX_DB");
@@ -456,14 +461,24 @@ static void
   const char* als_influx_auth = getenv("ALS_INFLUX_AUTH");
   const char* influx_auth = (als_influx_auth!=NULL)? als_influx_auth : ""; //-u root:root
 
-  char buf[512];
-  snprintf(buf, sizeof buf, "/usr/bin/curl -s -S -o /dev/null %s -i -XPOST http://%s:8086/write?db=%s --data-binary 'kurento_ls_stats,host=%s bitrate=%i'", influx_auth, influx_host, influx_db, host, br);
+  char dataBin[__INFLUX_BATCH_SIZE__*80];
+  for (int i = 0; i < __INFLUX_BATCH_SIZE__; ++i) {
+    char tmp[80];
+    snprintf(tmp, sizeof(tmp), "kurento_ls_stats bitrate=%i %lu000000000\n", br[i]->bitrate, br[i]->timestamp);
+    strcat(dataBin, tmp);
+    free(br[i]);
+  }
+
+  char buf[__INFLUX_BATCH_SIZE__*80+150];
+  snprintf(buf, sizeof buf, "/usr/bin/curl -s -S -o /dev/null %s -i -XPOST http://%s:8086/write?db=%s --data-binary '%s'", influx_auth, influx_host, influx_db, dataBin);
   GST_DEBUG("sending %s to influxdb", buf);
   int result = system(buf);
   if (result != 0) {
       GST_ERROR("failed to send %s to influxdb", buf);
   }
-  free(bitrate);
+
+  free(bre);
+
   return 0;
 }
 
@@ -775,13 +790,23 @@ kms_remb_remote_update (KmsRembRemote * rm,
       "Recv REMB, SSRC: %u, bitrate: %u", remb_packet->ssrcs[0],
       remb_packet->bitrate);
 
-//  struct remb_info ri;
-  guint32* br = malloc(sizeof(guint32));
-  *br = remb_packet->bitrate;
-//  ri.bitrate = malloc(sizeof(guint32));
-//  *ri.bitrate = remb_packet->bitrate;
-//  strcpy(ri.type, "recv");
-  pthread_create(&inc_x_thread, NULL, send_remb_to_influx, br);
+  struct br_estimation* be = malloc(sizeof(struct br_estimation));
+  be->bitrate = remb_packet->bitrate;
+  be->timestamp = (unsigned long)time(NULL);
+  bitrate_estimations[br_estimation_counter] = be;
+    br_estimation_counter++;
+
+  if (br_estimation_counter == __INFLUX_BATCH_SIZE__) {
+      struct br_estimation* copy_estimations = malloc(sizeof(struct br_estimation)*__INFLUX_BATCH_SIZE__);
+      memcpy(copy_estimations, bitrate_estimations, sizeof(struct br_estimation)*__INFLUX_BATCH_SIZE__);
+      pthread_create(&inc_x_thread, NULL, send_remb_to_influx, copy_estimations);
+      br_estimation_counter = 0;
+  }
+//  *br = remb_packet->bitrate;
+////  ri.bitrate = malloc(sizeof(guint32));
+////  *ri.bitrate = remb_packet->bitrate;
+////  strcpy(ri.type, "recv");
+//  pthread_create(&inc_x_thread, NULL, send_remb_to_influx, br);
 
   br_send = remb_packet->bitrate;
 
