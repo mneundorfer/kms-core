@@ -18,6 +18,10 @@
 #include "kmsremb.h"
 #include "kmsrtcp.h"
 #include "constants.h"
+#include <unistd.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdint.h>
 
 #define GST_CAT_DEFAULT kmsutils
 GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
@@ -38,6 +42,11 @@ G_DEFINE_QUARK (KMS_REMB_REMOTE, kms_remb_remote);
 #define DEFAULT_REMB_UP_LOSSES 12       /* 4% losses */
 
 #define REMB_MAX_FACTOR_INPUT_BR 2
+
+struct remb_info {
+    guint32* bitrate;
+    char type[5];
+};
 
 static void
 kms_remb_base_destroy (KmsRembBase * self)
@@ -434,6 +443,33 @@ typedef struct _AddSsrcsData
 } AddSsrcsData;
 
 static void
+*send_remb_to_influx (void *bitrate)
+{
+  guint32 br = *(guint32*) bitrate;
+
+  const char* als_client_host = getenv("ALS_CLIENT_HOST");
+  const char* host = (als_client_host!=NULL)? als_client_host : "unknown";
+  const char* als_influx_host = getenv("ALS_INFLUX_HOST");
+  const char* influx_host = (als_influx_host!=NULL)? als_influx_host : "127.0.0.1";
+  const char* als_influx_db = getenv("ALS_INFLUX_DB");
+  const char* influx_db = (als_influx_db!=NULL)? als_influx_db : "stats";
+  const char* als_influx_auth = getenv("ALS_INFLUX_AUTH");
+  const char* influx_auth = (als_influx_auth!=NULL)? als_influx_auth : ""; //-u root:root
+
+  char buf[512];
+  snprintf(buf, sizeof buf, "/usr/bin/curl -s -S -o /dev/null %s -i -XPOST http://%s:8086/write?db=%s --data-binary 'kurento_ls_stats,host=%s bitrate=%i'", influx_auth, influx_host, influx_db, host, br);
+  GST_DEBUG("sending %s to influxdb", buf);
+  int result = system(buf);
+  if (result != 0) {
+      GST_ERROR("failed to send %s to influxdb", buf);
+  }
+  free(bitrate);
+  return 0;
+}
+
+pthread_t inc_x_thread;
+
+static void
 add_ssrcs (KmsRlRemoteSession * rlrs, AddSsrcsData * data)
 {
   KmsRembBase *rb = KMS_REMB_BASE (data->rl);
@@ -444,6 +480,10 @@ add_ssrcs (KmsRlRemoteSession * rlrs, AddSsrcsData * data)
   // Local bitrate estimation
   GST_DEBUG_OBJECT (rb->rtpsess, "Send REMB, SSRC: %u, bitrate: %u",
       rlrs->ssrc, data->remb_packet->bitrate);
+
+  guint32* br = malloc(sizeof(guint32));
+  *br = data->remb_packet->bitrate;
+  pthread_create(&inc_x_thread, NULL, send_remb_to_influx, br);
 
   kms_remb_base_update_stats (rb, rlrs->ssrc, data->remb_packet->bitrate);
 }
@@ -734,6 +774,14 @@ kms_remb_remote_update (KmsRembRemote * rm,
   GST_DEBUG_OBJECT (KMS_REMB_BASE (rm)->rtpsess,
       "Recv REMB, SSRC: %u, bitrate: %u", remb_packet->ssrcs[0],
       remb_packet->bitrate);
+
+//  struct remb_info ri;
+  guint32* br = malloc(sizeof(guint32));
+  *br = remb_packet->bitrate;
+//  ri.bitrate = malloc(sizeof(guint32));
+//  *ri.bitrate = remb_packet->bitrate;
+//  strcpy(ri.type, "recv");
+  pthread_create(&inc_x_thread, NULL, send_remb_to_influx, br);
 
   br_send = remb_packet->bitrate;
 
