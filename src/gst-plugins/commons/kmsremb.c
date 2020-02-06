@@ -768,6 +768,8 @@ send_remb_event_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   return GST_PAD_PROBE_REMOVE;
 }
 
+guint32 last_bre = 0;
+
 static void
 kms_remb_remote_update (KmsRembRemote * rm,
     const KmsRTCPPSFBAFBREMBPacket * remb_packet)
@@ -790,23 +792,25 @@ kms_remb_remote_update (KmsRembRemote * rm,
       "Recv REMB, SSRC: %u, bitrate: %u", remb_packet->ssrcs[0],
       remb_packet->bitrate);
 
-  struct br_estimation* be = malloc(sizeof(struct br_estimation));
-  be->bitrate = remb_packet->bitrate;
-  be->timestamp = (unsigned long)time(NULL);
-  bitrate_estimations[br_estimation_counter] = be;
+  if (last_bre != remb_packet->bitrate) {
+    struct br_estimation *be = malloc(sizeof(struct br_estimation));
+    be->bitrate = remb_packet->bitrate;
+    be->timestamp = (unsigned long)time(NULL);
+    bitrate_estimations[br_estimation_counter] = be;
     br_estimation_counter++;
 
-  if (br_estimation_counter == __INFLUX_BATCH_SIZE__) {
-      struct br_estimation* copy_estimations = malloc(sizeof(struct br_estimation)*__INFLUX_BATCH_SIZE__);
-      memcpy(copy_estimations, bitrate_estimations, sizeof(struct br_estimation)*__INFLUX_BATCH_SIZE__);
-      pthread_create(&inc_x_thread, NULL, send_remb_to_influx, copy_estimations);
+    if (br_estimation_counter == __INFLUX_BATCH_SIZE__) {
+      struct br_estimation *copy_estimations =
+          malloc(sizeof(struct br_estimation) * __INFLUX_BATCH_SIZE__);
+      memcpy(copy_estimations, bitrate_estimations,
+             sizeof(struct br_estimation) * __INFLUX_BATCH_SIZE__);
+      pthread_create(&inc_x_thread, NULL, send_remb_to_influx,
+                     copy_estimations);
       br_estimation_counter = 0;
+    }
   }
-//  *br = remb_packet->bitrate;
-////  ri.bitrate = malloc(sizeof(guint32));
-////  *ri.bitrate = remb_packet->bitrate;
-////  strcpy(ri.type, "recv");
-//  pthread_create(&inc_x_thread, NULL, send_remb_to_influx, br);
+
+  last_bre = remb_packet->bitrate;
 
   br_send = remb_packet->bitrate;
 
